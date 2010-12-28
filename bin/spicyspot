@@ -1,0 +1,207 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+# Copyright (c) 2010 Örjan Persson
+
+import argcmd
+
+import httplib
+import operator
+import re
+import urllib
+
+
+PROBE_URL = 'http://www.google.com/'
+PROBE_METHOD = 'HEAD'
+
+
+def http_request(method, url, body=None, headers={}):
+    parts = httplib.urlsplit(url)
+
+    conn_cls = {'http':  httplib.HTTPConnection,
+                'https': httplib.HTTPSConnection}.get(parts.scheme)
+    if conn_cls is None:
+        raise ValueError('Invalid HTTP scheme: %s' % (parts.scheme,))
+
+    conn = conn_cls(*(parts.hostname, parts.port))
+    conn.set_debuglevel(10)
+
+    # retrieve everything after hostname and port
+    m = re.match(r'https?://[^:/]+(?::\d+)?(.*)', url)
+    path = m.group(1)
+
+    conn.request(method, path, body, headers)
+
+    return conn.getresponse()
+
+
+def get_query_params(url):
+    parts = httplib.urlsplit(url)
+    query = parts.query.split('&')
+
+    # XXX there was a function to do this somewhere, right?
+    params = {}
+    for kv in query:
+        k, v = kv.split('=')
+        params[urllib.unquote(k)] = urllib.unquote(v)
+    return params
+
+
+def opts_login(parser):
+    parser.add_argument('-u', '--username')
+    parser.add_argument('-p', '--password')
+
+
+def cmd_login(args):
+    """Login to chillispot"""
+    params = {}
+
+    # probe to see if we need to login
+    resp = http_request(PROBE_METHOD, PROBE_URL)
+    assert resp.status == 302, 'Expected 302 on probe url'
+
+    # retrieve the redirection url and check if we're going to google or
+    # to a login page. if the latter, let's follow it.
+    url = resp.getheader('location')
+    parts = httplib.urlsplit(url)
+    if parts.hostname.find('google') != -1:
+        return 1
+    assert parts.scheme == 'https', 'Will not send credentials using http'
+
+    addr = (parts.hostname, parts.port)
+
+    conn = httplib.HTTPSConnection(*addr)
+    conn.set_debuglevel(10)
+
+    # first go to the login page
+    """
+    login = '?'.join((parts.path, parts.query))
+    conn.request('GET', login)
+    print '-*' * 30
+    print 'HANDSHAKE'
+    print '-*' * 30
+    resp = conn.getresponse()
+    print resp.getheaders()
+    print repr(resp)
+    print resp.read()
+    """
+    conn = httplib.HTTPSConnection(*addr)
+    conn.set_debuglevel(10)
+
+    # TODO extract uamip and uamport etc and save for later
+    params = get_query_params(url)
+
+    extra = urllib.urlencode({'res': 'popup1',
+                              'uamip': params['uamip'],
+                              'uamport': params['uamport']})
+
+    path = '?'.join((parts.path, extra))
+
+    body = urllib.urlencode({'challenge': params['challenge'],
+                             'uamip': params['uamip'],
+                             'uamport': params['uamport'],
+                             'userurl': '',
+                             'redirurl': '',
+                             'button': 'Login',
+                             'UserName': args.username,
+                             'Password': args.password})
+
+
+    # do the real login
+    print '-*' * 30
+    print 'LOGIN'
+    print '-*' * 30
+    conn.request('POST', path, body)
+
+    resp = conn.getresponse()
+    print 'response', resp
+    print repr(resp)
+    print dir(resp)
+    print resp.getheaders()
+    body = resp.read()
+    print 'body', body
+
+    xml = get_wisp_xml(body)
+
+    # TODO use tagsoup or something and login to 192.168...
+    import libxml2
+
+    tree = libxml2.parseDoc(xml)
+
+    res = tree.xpathEval('//LoginResultsURL')
+    assert len(res) == 1, 'more than one login result url'
+    print dir(res)
+
+    print '-*' * 30
+    print 'LOGGGGG'
+    print '-*' * 30
+    login_url = res[0].content
+    resp = http_request('GET', login_url)
+    print resp.getheaders()
+    print resp.read()
+
+    url = resp.getheader('location')
+    params = get_query_params(url)
+    if params.get('res') == 'success':
+        left = int(params.get('timeleft', 0))
+
+        # hours, minutes and seconds
+        numbers = []
+        factors = [24, 60, 60, 1]
+        for i, f in enumerate(factors):
+            x = reduce(operator.mul, factors[i:])
+            numbers.append(left // x)
+            left -= numbers[-1] * x
+        days, hours, minutes, seconds = numbers
+
+        t = '%02d:%02d:%02d' % (hours, minutes, seconds)
+        if days:
+            t = '%d days, %s' % (days, t)
+        print 'Logged in as %s. Expires in %s.' % (args.username, t)
+
+
+def cmd_logout(args):
+    """Logout from chillispot"""
+    # TODO automatically detect this somehow
+    addr = ('192.168.182.1', 3990)
+    url = 'http://%s:%d/logoff' % (addr,)
+
+
+def get_wisp_xml(document):
+    """Extracts the embedded XML from the HTML document
+
+    Inside the HTML response, there's a <xml> chunk inside a comment, this
+    extracts this section and fixes some brokeness.
+    """
+    m = re.search(r'<!--\s*(<\?xml.*)-->', document, re.MULTILINE | re.DOTALL)
+    xml = m.group(1)
+
+    # the amps in the xml aren't properly escaped
+    escaped = re.sub(r'&([^;=]+)=', '&amp;\\1=', xml)
+
+    return escaped
+
+
+def cmd_test(args):
+    html = file('login.html').read()
+
+    from BeautifulSoup import BeautifulSoup
+
+    # TODO use libxml2 now when things are properly escaped
+    xml = get_wisp_xml(html)
+
+    import libxml2
+
+    tree = libxml2.parseDoc(xml)
+
+    print 'balle'
+    for x in tree.xpathEval('//LoginResultsURL'):
+        print dir(x)
+        print 'XX', x, 'XX'
+        print x.content
+
+    soup = BeautifulSoup(xml)
+    print soup.prettify()
+
+if __name__ == '__main__':
+    # TODO hide globals
+    argcmd.main(globals())
