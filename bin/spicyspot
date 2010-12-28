@@ -5,13 +5,14 @@
 import argcmd
 
 import httplib
+import libxml2
 import operator
 import re
 import urllib
 
 
 PROBE_URL = 'http://www.google.com/'
-PROBE_METHOD = 'HEAD'
+PROBE_METHOD = 'GET'
 
 
 def http_request(method, url, body=None, headers={}):
@@ -23,7 +24,7 @@ def http_request(method, url, body=None, headers={}):
         raise ValueError('Invalid HTTP scheme: %s' % (parts.scheme,))
 
     conn = conn_cls(*(parts.hostname, parts.port))
-    conn.set_debuglevel(10)
+    #conn.set_debuglevel(10)
 
     # retrieve everything after hostname and port
     m = re.match(r'https?://[^:/]+(?::\d+)?(.*)', url)
@@ -46,6 +47,35 @@ def get_query_params(url):
     return params
 
 
+def get_wisp(document):
+    """Retrieve the WISP inside the HTML Document
+
+    Inside the HTML response, there's a <xml> chunk inside a comment, this
+    extracts this section and fixes some brokeness.
+    """
+    m = re.search(r'<!--\s*(<\?xml.*)-->', document, re.MULTILINE | re.DOTALL)
+    xml = m.group(1)
+
+    # the amps in the xml aren't properly escaped
+    escaped = re.sub(r'&([^;=]+)=', '&amp;\\1=', xml)
+
+    # return the parsed document (it's supposed to be our internal representation)
+    return WISPAccessGatewayParam(escaped)
+
+
+class WISPAccessGatewayParam(object):
+    def __init__(self, xml):
+        self.__tree = libxml2.parseDoc(xml)
+
+    def get_param(self, name):
+        r = self.__tree.xpathEval('//' + name)
+        if not r:
+            raise ValueError('No such wisp param: %s' % (name,))
+        elif len(r) > 1:
+            raise ValueError('Multiple value error: %s' % (name,))
+        return r[0].content
+
+
 def opts_login(parser):
     parser.add_argument('-u', '--username')
     parser.add_argument('-p', '--password')
@@ -53,98 +83,49 @@ def opts_login(parser):
 
 def cmd_login(args):
     """Login to chillispot"""
+    # TODO make this a bit more generic, following the ACME WISP?
+    # http://www.acmewisp.com/
     params = {}
 
     # probe to see if we need to login
     resp = http_request(PROBE_METHOD, PROBE_URL)
     assert resp.status == 302, 'Expected 302 on probe url'
 
-    # retrieve the redirection url and check if we're going to google or
-    # to a login page. if the latter, let's follow it.
     url = resp.getheader('location')
     parts = httplib.urlsplit(url)
     if parts.hostname.find('google') != -1:
         return 1
+
+    # retrieve the login url from the smartclient xml instead of following
+    # the http redirect and doing multiple hops
+    body = resp.read()
+    wisp = get_wisp(body)
+    login_url = wisp.get_param('LoginURL')
+    parts = httplib.urlsplit(login_url)
     assert parts.scheme == 'https', 'Will not send credentials using http'
 
-    addr = (parts.hostname, parts.port)
-
-    conn = httplib.HTTPSConnection(*addr)
-    conn.set_debuglevel(10)
-
-    # first go to the login page
-    """
-    login = '?'.join((parts.path, parts.query))
-    conn.request('GET', login)
-    print '-*' * 30
-    print 'HANDSHAKE'
-    print '-*' * 30
-    resp = conn.getresponse()
-    print resp.getheaders()
-    print repr(resp)
-    print resp.read()
-    """
-    conn = httplib.HTTPSConnection(*addr)
-    conn.set_debuglevel(10)
-
-    # TODO extract uamip and uamport etc and save for later
-    params = get_query_params(url)
-
-    extra = urllib.urlencode({'res': 'popup1',
-                              'uamip': params['uamip'],
-                              'uamport': params['uamport']})
-
-    path = '?'.join((parts.path, extra))
-
-    body = urllib.urlencode({'challenge': params['challenge'],
-                             'uamip': params['uamip'],
-                             'uamport': params['uamport'],
-                             'userurl': '',
-                             'redirurl': '',
-                             'button': 'Login',
+    # button Login is the key to trigger the stupid cgi script
+    body = urllib.urlencode({'button': 'Login',
                              'UserName': args.username,
                              'Password': args.password})
 
+    resp = http_request('POST', login_url, body)
 
-    # do the real login
-    print '-*' * 30
-    print 'LOGIN'
-    print '-*' * 30
-    conn.request('POST', path, body)
-
-    resp = conn.getresponse()
-    print 'response', resp
-    print repr(resp)
-    print dir(resp)
-    print resp.getheaders()
     body = resp.read()
-    print 'body', body
+    wisp = get_wisp(body)
 
-    xml = get_wisp_xml(body)
-
-    # TODO use tagsoup or something and login to 192.168...
-    import libxml2
-
-    tree = libxml2.parseDoc(xml)
-
-    res = tree.xpathEval('//LoginResultsURL')
-    assert len(res) == 1, 'more than one login result url'
-    print dir(res)
-
-    print '-*' * 30
-    print 'LOGGGGG'
-    print '-*' * 30
-    login_url = res[0].content
+    # and one more login request
+    # TODO why is the login_url for chillispot hardcoded to use http?
+    login_url = wisp.get_param('LoginResultsURL')
     resp = http_request('GET', login_url)
-    print resp.getheaders()
-    print resp.read()
+    body = resp.read()
 
     url = resp.getheader('location')
     params = get_query_params(url)
     if params.get('res') == 'success':
         left = int(params.get('timeleft', 0))
 
-        # hours, minutes and seconds
+        # extract days, hours, minutes and seconds
         numbers = []
         factors = [24, 60, 60, 1]
         for i, f in enumerate(factors):
@@ -163,44 +144,17 @@ def cmd_logout(args):
     """Logout from chillispot"""
     # TODO automatically detect this somehow
     addr = ('192.168.182.1', 3990)
-    url = 'http://%s:%d/logoff' % (addr,)
+    url = 'http://%s:%d/logoff' % addr
 
+    resp = http_request('GET', url)
+    wisp = get_wisp(resp.read())
 
-def get_wisp_xml(document):
-    """Extracts the embedded XML from the HTML document
+    message = int(wisp.get_param('MessageType'))
+    assert message == 130, 'Invalid message type'
+    rc = int(wisp.get_param('ResponseCode'))
+    assert rc == 150, 'Invalid response code'
+    print 'Logged out.'
 
-    Inside the HTML response, there's a <xml> chunk inside a comment, this
-    extracts this section and fixes some brokeness.
-    """
-    m = re.search(r'<!--\s*(<\?xml.*)-->', document, re.MULTILINE | re.DOTALL)
-    xml = m.group(1)
-
-    # the amps in the xml aren't properly escaped
-    escaped = re.sub(r'&([^;=]+)=', '&amp;\\1=', xml)
-
-    return escaped
-
-
-def cmd_test(args):
-    html = file('login.html').read()
-
-    from BeautifulSoup import BeautifulSoup
-
-    # TODO use libxml2 now when things are properly escaped
-    xml = get_wisp_xml(html)
-
-    import libxml2
-
-    tree = libxml2.parseDoc(xml)
-
-    print 'balle'
-    for x in tree.xpathEval('//LoginResultsURL'):
-        print dir(x)
-        print 'XX', x, 'XX'
-        print x.content
-
-    soup = BeautifulSoup(xml)
-    print soup.prettify()
 
 if __name__ == '__main__':
     # TODO hide globals
