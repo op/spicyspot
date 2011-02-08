@@ -77,8 +77,9 @@ class WISPAccessGatewayParam(object):
 
 
 def opts_login(parser):
-    parser.add_argument('-u', '--username')
-    parser.add_argument('-p', '--password')
+    parser.add_argument('-u', '--username', help='username')
+    parser.add_argument('-p', '--password', help='password')
+    parser.add_argument('--insecure', action='store_true', help='continue despite security problems')
 
 
 def cmd_login(args):
@@ -102,7 +103,8 @@ def cmd_login(args):
     wisp = get_wisp(body)
     login_url = wisp.get_param('LoginURL')
     parts = httplib.urlsplit(login_url)
-    assert parts.scheme == 'https', 'Will not send credentials using http'
+    if not args.insecure:
+        assert parts.scheme == 'https', 'Will not send credentials using http'
 
     # button Login is the key to trigger the stupid cgi script
     body = urllib.urlencode({'button': 'Login',
